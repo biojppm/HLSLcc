@@ -948,7 +948,7 @@ void ToGLSL::DeclareStructConstants(const uint32_t ui32BindingPoint,
 	/* [layout (location = X)] uniform vec4 HLSLConstantBufferName[numConsts]; */
 	if ((psContext->flags & HLSLCC_FLAG_VULKAN_BINDINGS) != 0)
 	{
-		ASSERT(0); // Catch this to see what's going on
+		//ASSERT(0); // Catch this to see what's going on
 		std::string bname = "wut";
 		GLSLCrossDependencyData::VulkanResourceBinding binding = psContext->psDependencies->GetVulkanResourceBinding(bname);
 		bformata(glsl, "layout(set = %d, binding = %d) ", binding.first, binding.second);
