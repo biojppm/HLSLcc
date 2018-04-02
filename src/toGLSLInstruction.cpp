@@ -90,7 +90,7 @@ void ToGLSL::AddOpAssignToDestWithMask(const Operand* psDest,
 	case SVT_FLOAT:
 	case SVT_FLOAT10:
 	case SVT_FLOAT16:
-		ASSERT(eSrcType != SVT_INT12 || eSrcType != SVT_INT16 && eSrcType != SVT_UINT16);
+		ASSERT(eSrcType != SVT_INT12 || (eSrcType != SVT_INT16 && eSrcType != SVT_UINT16));
 		if (psContext->psShader->ui32MajorVersion > 3)
 		{
 			if (eSrcType == SVT_INT)
@@ -892,7 +892,8 @@ void ToGLSL::GetResInfoData(Instruction* psInst, int index, int destElem)
 	bstring glsl = *psContext->currentGLSLString;
 	int numParenthesis = 0;
 	const RESINFO_RETURN_TYPE eResInfoReturnType = psInst->eResInfoReturnType;
-	const int isUAV = (psInst->asOperands[2].eType == OPERAND_TYPE_UNORDERED_ACCESS_VIEW);
+	bool isUAV = (psInst->asOperands[2].eType == OPERAND_TYPE_UNORDERED_ACCESS_VIEW);
+	bool isMS = psInst->eResDim == RESOURCE_DIMENSION_TEXTURE2DMS || psInst->eResDim == RESOURCE_DIMENSION_TEXTURE2DMSARRAY;
 
 	psContext->AddIndentation();
 	AddOpAssignToDestWithMask(&psInst->asOperands[0], eResInfoReturnType == RESINFO_INSTRUCTION_RETURN_UINT ? SVT_UINT : SVT_FLOAT, 1, "=", &numParenthesis, 1 << destElem);
@@ -922,7 +923,7 @@ void ToGLSL::GetResInfoData(Instruction* psInst, int index, int destElem)
 
 			TranslateOperand(&psInst->asOperands[2], TO_FLAG_NONE);
 
-			if (!isUAV)
+			if (!isUAV && !isMS)
 			{
 				bcatcstr(glsl, ", ");
 				TranslateOperand(&psInst->asOperands[1], TO_FLAG_INTEGER);
@@ -1077,7 +1078,7 @@ void ToGLSL::TranslateTextureSample(Instruction* psInst,
 	if (ui32Flags & TEXSMP_FLAG_GATHER)
 		funcName = "textureGather";
 
-	uint32_t uniqueNameCounter;
+	uint32_t uniqueNameCounter = 0;
 
 	// In GLSL, for every texture sampling func overload, except for cubemap arrays, the 
 	// depth compare reference value is given as the last component of the texture coord vector.
@@ -1391,7 +1392,6 @@ void ToGLSL::TranslateShaderStorageLoad(Instruction* psInst)
 	}
 	for (component = 0; component < 4; component++)
 	{
-		const ShaderVarType *psVar = NULL;
 		int addedBitcast = 0;
 		if (!(destMask & (1 << component)))
 			continue;
@@ -1835,6 +1835,14 @@ void ToGLSL::TranslateConditional(
 		statement = "return";
 	}
 
+	if (psInst->m_IsStaticBranch)
+	{
+		// Instead of the actual condition, use the specialization constant instead
+
+		// But first we'll have to make sure the original values don't get dropped out (we rely on glslang not being very smart)
+		bcatcstr(glsl, "if(false)\n {\n");
+	}
+
 	SHADER_VARIABLE_TYPE argType = psInst->asOperands[0].GetDataType(psContext);
 	if (argType == SVT_BOOL)
 	{
@@ -1884,6 +1892,32 @@ void ToGLSL::TranslateConditional(
 			bcatcstr(glsl, " {\n");
 		}
 	}
+	if (psInst->m_IsStaticBranch)
+	{
+		if (psInst->eOpcode == OPCODE_IF)
+		{
+			bcatcstr(glsl, "}\n}\n");
+		}
+		else
+		{
+			bcatcstr(glsl, "}\n");
+		}
+		bcatcstr(glsl, "if(");
+		if (psInst->eBooleanTestType != INSTRUCTION_TEST_NONZERO)
+			bcatcstr(glsl, "!");
+		bcatcstr(glsl, psInst->m_StaticBranchName.c_str());
+		if (psInst->eOpcode != OPCODE_IF)
+		{
+			bformata(glsl, "){%s;}\n", statement);
+		}
+		else
+		{
+			bcatcstr(glsl, "){\n");
+		}
+		return;
+
+	}
+
 }
 
 void ToGLSL::TranslateInstruction(Instruction* psInst, bool isEmbedded /* = false */)
@@ -1891,13 +1925,15 @@ void ToGLSL::TranslateInstruction(Instruction* psInst, bool isEmbedded /* = fals
 	bstring glsl = *psContext->currentGLSLString;
 	int numParenthesis = 0;
 	const bool isVulkan = ((psContext->flags & HLSLCC_FLAG_VULKAN_BINDINGS) != 0);
+	const bool avoidAtomicCounter = ((psContext->flags & HLSLCC_FLAG_AVOID_SHADER_ATOMIC_COUNTERS) != 0);
 
 	if (!isEmbedded)
 	{
 
 #ifdef _DEBUG
-		psContext->AddIndentation();
-		bformata(glsl, "//Instruction %d\n", psInst->id);
+		// Uncomment to print instruction IDs
+		//psContext->AddIndentation();
+		//bformata(glsl, "//Instruction %d\n", psInst->id);
 #if 0
 		if (psInst->id == 73)
 		{
@@ -2095,10 +2131,10 @@ void ToGLSL::TranslateInstruction(Instruction* psInst, bool isEmbedded /* = fals
 						  }
 						  else
 						  {
-							  // Do component-wise and, glsl doesn't support && on bvecs
+							  // Do component-wise and, glsl doesn't support || on bvecs
 							  for (uint32_t k = 0; k < 4; k++)
 							  {
-								  if ((destMask && (1 << k)) == 0)
+								  if ((destMask & (1 << k)) == 0)
 									  continue;
 
 								  int needsParenthesis = 0;
@@ -2306,8 +2342,20 @@ void ToGLSL::TranslateInstruction(Instruction* psInst, bool isEmbedded /* = fals
 						bcatcstr(glsl, "//UDIV\n");
 #endif
 						//destQuotient, destRemainder, src0, src1
-						CallBinaryOp("/", psInst, 0, 2, 3, SVT_UINT);
-						CallBinaryOp("%", psInst, 1, 2, 3, SVT_UINT);
+
+						// There are cases where destQuotient is the same variable as src0 or src1. If that happens,
+						// we need to compute "%" before the "/" in order to avoid src0 or src1 being overriden first.
+						if ((psInst->asOperands[0].eType != psInst->asOperands[2].eType || psInst->asOperands[0].ui32RegisterNumber != psInst->asOperands[2].ui32RegisterNumber)
+						 && (psInst->asOperands[0].eType != psInst->asOperands[3].eType || psInst->asOperands[0].ui32RegisterNumber != psInst->asOperands[3].ui32RegisterNumber))
+						{
+							CallBinaryOp("/", psInst, 0, 2, 3, SVT_UINT);
+							CallBinaryOp("%", psInst, 1, 2, 3, SVT_UINT);
+						}
+						else
+						{
+							CallBinaryOp("%", psInst, 1, 2, 3, SVT_UINT);
+							CallBinaryOp("/", psInst, 0, 2, 3, SVT_UINT);
+						}
 						break;
 	}
 	case OPCODE_DIV:
@@ -2751,10 +2799,7 @@ void ToGLSL::TranslateInstruction(Instruction* psInst, bool isEmbedded /* = fals
 								  uint32_t varFound;
 
 								  uint32_t funcPointer;
-								  uint32_t funcTableIndex;
-								  uint32_t funcTable;
 								  uint32_t funcBodyIndex;
-								  uint32_t funcBody;
 								  uint32_t ui32NumBodiesPerTable;
 
 #ifdef _DEBUG
@@ -2765,14 +2810,9 @@ void ToGLSL::TranslateInstruction(Instruction* psInst, bool isEmbedded /* = fals
 								  ASSERT(psInst->asOperands[0].eIndexRep[0] == OPERAND_INDEX_IMMEDIATE32);
 
 								  funcPointer = psInst->asOperands[0].aui32ArraySizes[0];
-								  funcTableIndex = psInst->asOperands[0].aui32ArraySizes[1];
 								  funcBodyIndex = psInst->ui32FuncIndexWithinInterface;
 
 								  ui32NumBodiesPerTable = psContext->psShader->funcPointer[funcPointer].ui32NumBodiesPerTable;
-
-								  funcTable = psContext->psShader->funcPointer[funcPointer].aui32FuncTables[funcTableIndex];
-
-								  funcBody = psContext->psShader->funcTable[funcTable].aui32FuncBodies[funcBodyIndex];
 
 								  varFound = psContext->psShader->sInfo.GetInterfaceVarFromOffset(funcPointer, &psVar);
 
@@ -3630,7 +3670,7 @@ void ToGLSL::TranslateInstruction(Instruction* psInst, bool isEmbedded /* = fals
 									break;
 								}
 
-								SHADER_VARIABLE_TYPE srcDataType;
+								SHADER_VARIABLE_TYPE srcDataType = SVT_FLOAT;
 								const ResourceBinding* psBinding = 0;
 								psContext->psShader->sInfo.GetResourceFromBindingPoint(RGROUP_UAV, psSrc->ui32RegisterNumber, &psBinding);
 								switch (psBinding->ui32ReturnType)
@@ -3646,6 +3686,8 @@ void ToGLSL::TranslateInstruction(Instruction* psInst, bool isEmbedded /* = fals
 									break;
 								default:
 									ASSERT(0);
+									// Suppress uninitialised variable warning
+									srcDataType = SVT_VOID;
 									break;
 								}
 
@@ -3983,13 +4025,13 @@ void ToGLSL::TranslateInstruction(Instruction* psInst, bool isEmbedded /* = fals
 #endif
 		psContext->AddIndentation();
 		AddAssignToDest(&psInst->asOperands[0], SVT_UINT, 1, &numParenthesis);
-		if (isVulkan)
+		if (isVulkan || avoidAtomicCounter)
 			bcatcstr(glsl, "atomicAdd(");
 		else
 			bcatcstr(glsl, "atomicCounterIncrement(");
 		ResourceName(glsl, psContext, RGROUP_UAV, psInst->asOperands[1].ui32RegisterNumber, 0);
 		bformata(glsl, "_counter");
-		if (isVulkan)
+		if (isVulkan || avoidAtomicCounter)
 			bcatcstr(glsl, ", 1u)");
 		else
 			bcatcstr(glsl, ")");
@@ -4004,14 +4046,14 @@ void ToGLSL::TranslateInstruction(Instruction* psInst, bool isEmbedded /* = fals
 #endif
 		psContext->AddIndentation();
 		AddAssignToDest(&psInst->asOperands[0], SVT_UINT, 1, &numParenthesis);
-		if (isVulkan)
-			bcatcstr(glsl, "atomicAdd(");
+		if (isVulkan || avoidAtomicCounter)
+			bcatcstr(glsl, "(atomicAdd(");
 		else
 			bcatcstr(glsl, "atomicCounterDecrement(");
 		ResourceName(glsl, psContext, RGROUP_UAV, psInst->asOperands[1].ui32RegisterNumber, 0);
 		bformata(glsl, "_counter");
-		if (isVulkan)
-			bcatcstr(glsl, ", 0xffffffffu)");
+		if (isVulkan || avoidAtomicCounter)
+			bcatcstr(glsl, ", 0xffffffffu) + 0xffffffffu)");
 		else
 			bcatcstr(glsl, ")");
 		AddAssignPrologue(numParenthesis);
@@ -4071,7 +4113,21 @@ void ToGLSL::TranslateInstruction(Instruction* psInst, bool isEmbedded /* = fals
 		AddAssignPrologue(numParenthesis);
 		break;
 	}
-
+	case OPCODE_SAMPLE_INFO:
+	{
+#ifdef _DEBUG
+		psContext->AddIndentation();
+		bcatcstr(glsl, "//SAMPLE_INFO\n");
+#endif
+		const RESINFO_RETURN_TYPE eResInfoReturnType = psInst->eResInfoReturnType;
+		psContext->AddIndentation();
+		AddAssignToDest(&psInst->asOperands[0], eResInfoReturnType == RESINFO_INSTRUCTION_RETURN_UINT ? SVT_UINT : SVT_FLOAT, 1, &numParenthesis);
+		bcatcstr(glsl, "textureSamples(");
+		TranslateOperand(&psInst->asOperands[1], TO_FLAG_NAME_ONLY);
+		bcatcstr(glsl, ")");
+		AddAssignPrologue(numParenthesis);
+		break;
+	}
 	case OPCODE_DMAX:
 	case OPCODE_DMIN:
 	case OPCODE_DMUL:

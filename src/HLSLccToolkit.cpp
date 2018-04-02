@@ -402,11 +402,13 @@ namespace HLSLcc
 			case RESOURCE_DIMENSION_TEXTURE1D:
 				return 1;
 			case RESOURCE_DIMENSION_TEXTURE2D:
+			case RESOURCE_DIMENSION_TEXTURE2DMS:
 			case RESOURCE_DIMENSION_TEXTURE1DARRAY:
 			case RESOURCE_DIMENSION_TEXTURECUBE:
 				return 2;
 			case RESOURCE_DIMENSION_TEXTURE3D:
 			case RESOURCE_DIMENSION_TEXTURE2DARRAY:
+			case RESOURCE_DIMENSION_TEXTURE2DMSARRAY:
 			case RESOURCE_DIMENSION_TEXTURECUBEARRAY:
 				return 3;
 			default:
@@ -455,11 +457,13 @@ namespace HLSLcc
 		return false;
 	}
 
+#ifndef fpcheck
 #ifdef _MSC_VER
 #define fpcheck(x) (_isnan(x) || !_finite(x))
 #else
 #define fpcheck(x) (std::isnan(x) || std::isinf(x))
 #endif
+#endif // #ifndef fpcheck
 
 	// Helper function to print floats with full precision
 	void PrintFloat(bstring b, float f)

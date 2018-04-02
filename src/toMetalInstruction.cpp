@@ -6,6 +6,7 @@
 #include "stdio.h"
 #include <stdlib.h>
 #include <algorithm>
+#include <cmath>
 #include "internal_includes/debug.h"
 #include "internal_includes/Shader.h"
 #include "internal_includes/Instruction.h"
@@ -111,7 +112,7 @@ void ToMetal::AddOpAssignToDestWithMask(const Operand* psDest,
 	case SVT_FLOAT:
 	case SVT_FLOAT10:
 	case SVT_FLOAT16:
-		ASSERT(eSrcType != SVT_INT12 || eSrcType != SVT_INT16 && eSrcType != SVT_UINT16);
+		ASSERT(eSrcType != SVT_INT12 || (eSrcType != SVT_INT16 && eSrcType != SVT_UINT16));
 		if (psContext->psShader->ui32MajorVersion > 3)
 		{
 			if (ui32DestElementCount > 1)
@@ -175,8 +176,8 @@ void ToMetal::AddComparison(Instruction* psInst, ComparisonType eType,
 
 	int needsParenthesis = 0;
 	if (typeFlag == TO_FLAG_NONE
-		&& psInst->asOperands[1].GetDataType(psContext) == SVT_FLOAT16
-		&& psInst->asOperands[1].GetDataType(psContext) == SVT_FLOAT16)
+		&& CanForceToHalfOperand(&psInst->asOperands[1])
+		&& CanForceToHalfOperand(&psInst->asOperands[2]))
 		typeFlag = TO_FLAG_FORCE_HALF;
 	ASSERT(s0ElemCount == s1ElemCount || s1ElemCount == 1 || s0ElemCount == 1);
 	if ((s0ElemCount != s1ElemCount) && (destElemCount > 1))
@@ -251,6 +252,25 @@ void ToMetal::AddComparison(Instruction* psInst, ComparisonType eType,
 	}
 }
 
+bool ToMetal::CanForceToHalfOperand(const Operand *psOperand)
+{
+	if (psOperand->GetDataType(psContext) == SVT_FLOAT16)
+		return true;
+
+	if (psOperand->eType == OPERAND_TYPE_IMMEDIATE32 || psOperand->eType == OPERAND_TYPE_IMMEDIATE_CONSTANT_BUFFER)
+	{
+		for (int i = 0; i < psOperand->iNumComponents; i++)
+		{
+			float val = fabs(psOperand->afImmediates[i]);
+			// Do not allow forcing immediate value to half if value is beyond half min/max boundaries
+			if (val != 0 && (val > 65504 || val < 6.10352e-5))
+				return false;
+		}
+		return true;
+	}
+
+	return false;
+}
 
 void ToMetal::AddMOVBinaryOp(const Operand *pDest, Operand *pSrc)
 {
@@ -392,10 +412,13 @@ void ToMetal::CallBinaryOp(const char* name, Instruction* psInst,
 	int needsParenthesis = 0;
 
 	if (eDataType == SVT_FLOAT
-		&& psInst->asOperands[dest].GetDataType(psContext) == SVT_FLOAT16
-		&& psInst->asOperands[src0].GetDataType(psContext) == SVT_FLOAT16
-		&& psInst->asOperands[src1].GetDataType(psContext) == SVT_FLOAT16)
+		&& CanForceToHalfOperand(&psInst->asOperands[dest])
+		&& CanForceToHalfOperand(&psInst->asOperands[src0])
+		&& CanForceToHalfOperand(&psInst->asOperands[src1]))
+	{
 		ui32Flags = TO_FLAG_FORCE_HALF;
+		eDataType = SVT_FLOAT16;
+	}
 
 	uint32_t maxElems = std::max(src1SwizCount, src0SwizCount);
 	if (src1SwizCount != src0SwizCount)
@@ -436,11 +459,11 @@ void ToMetal::CallTernaryOp(const char* op1, const char* op2, Instruction* psIns
 	int numParenthesis = 0;
 
 	if (dataType == TO_FLAG_NONE
-		&& psInst->asOperands[dest].GetDataType(psContext) == SVT_FLOAT16
-		&& psInst->asOperands[src0].GetDataType(psContext) == SVT_FLOAT16
-		&& psInst->asOperands[src1].GetDataType(psContext) == SVT_FLOAT16
-		&& psInst->asOperands[src2].GetDataType(psContext) == SVT_FLOAT16)
-		ui32Flags = TO_FLAG_FORCE_HALF;
+		&& CanForceToHalfOperand(&psInst->asOperands[dest])
+		&& CanForceToHalfOperand(&psInst->asOperands[src0])
+		&& CanForceToHalfOperand(&psInst->asOperands[src1])
+		&& CanForceToHalfOperand(&psInst->asOperands[src2]))
+		ui32Flags = dataType = TO_FLAG_FORCE_HALF;
 
 	if (src1SwizCount != src0SwizCount || src2SwizCount != src0SwizCount)
 	{
@@ -472,10 +495,10 @@ void ToMetal::CallHelper3(const char* name, Instruction* psInst,
 	uint32_t dstSwizCount = psInst->asOperands[dest].GetNumSwizzleElements();
 	int numParenthesis = 0;
 
-	if (psInst->asOperands[dest].GetDataType(psContext) == SVT_FLOAT16
-		&& psInst->asOperands[src0].GetDataType(psContext) == SVT_FLOAT16
-		&& psInst->asOperands[src1].GetDataType(psContext) == SVT_FLOAT16
-		&& psInst->asOperands[src2].GetDataType(psContext) == SVT_FLOAT16)
+	if (CanForceToHalfOperand(&psInst->asOperands[dest])
+		&& CanForceToHalfOperand(&psInst->asOperands[src0])
+		&& CanForceToHalfOperand(&psInst->asOperands[src1])
+		&& CanForceToHalfOperand(&psInst->asOperands[src2]))
 		ui32Flags = TO_FLAG_FORCE_HALF | TO_AUTO_BITCAST_TO_FLOAT;
 
 	if ((src1SwizCount != src0SwizCount || src2SwizCount != src0SwizCount) && paramsShouldFollowWriteMask)
@@ -511,9 +534,9 @@ void ToMetal::CallHelper2(const char* name, Instruction* psInst,
 	int isDotProduct = (strncmp(name, "dot", 3) == 0) ? 1 : 0;
 	int numParenthesis = 0;
 
-	if (psInst->asOperands[dest].GetDataType(psContext) == SVT_FLOAT16
-		&& psInst->asOperands[src0].GetDataType(psContext) == SVT_FLOAT16
-		&& psInst->asOperands[src1].GetDataType(psContext) == SVT_FLOAT16)
+	if (CanForceToHalfOperand(&psInst->asOperands[dest])
+		&& CanForceToHalfOperand(&psInst->asOperands[src0])
+		&& CanForceToHalfOperand(&psInst->asOperands[src1]))
 		ui32Flags = TO_FLAG_FORCE_HALF | TO_AUTO_BITCAST_TO_FLOAT;
 
 
@@ -604,8 +627,8 @@ void ToMetal::CallHelper1(const char* name, Instruction* psInst,
 	int numParenthesis = 0;
 
 	psContext->AddIndentation();
-	if (psInst->asOperands[dest].GetDataType(psContext) == SVT_FLOAT16
-		&& psInst->asOperands[src0].GetDataType(psContext) == SVT_FLOAT16)
+	if (CanForceToHalfOperand(&psInst->asOperands[dest])
+		&& CanForceToHalfOperand(&psInst->asOperands[src0]))
 		ui32Flags = TO_FLAG_FORCE_HALF | TO_AUTO_BITCAST_TO_FLOAT;
 
 	AddAssignToDest(&psInst->asOperands[dest], ui32Flags & TO_FLAG_FORCE_HALF ? SVT_FLOAT16 : SVT_FLOAT, dstSwizCount, &numParenthesis);
@@ -646,7 +669,6 @@ void ToMetal::TranslateTexelFetch(
 	bstring glsl)
 {
 	int numParenthesis = 0;
-	uint32_t destCount = psInst->asOperands[0].GetNumSwizzleElements();
 	psContext->AddIndentation();
 	AddAssignToDest(&psInst->asOperands[0], psContext->psShader->sInfo.GetTextureDataType(psInst->asOperands[2].ui32RegisterNumber), 4, &numParenthesis);
 	glsl << TranslateOperand(&psInst->asOperands[2], TO_FLAG_NONE);
@@ -714,7 +736,7 @@ void ToMetal::TranslateTexelFetch(
 	}
 	bcatcstr(glsl, ")");
 
-	AddSwizzleUsingElementCount(glsl, destCount);
+	glsl << TranslateOperandSwizzle(&psInst->asOperands[2], psInst->asOperands[0].GetAccessMask(), 0);
 	AddAssignPrologue(numParenthesis);
 }
 
@@ -724,7 +746,6 @@ void ToMetal::TranslateTexelFetchOffset(
 	bstring glsl)
 {
 	int numParenthesis = 0;
-	uint32_t destCount = psInst->asOperands[0].GetNumSwizzleElements();
 	psContext->AddIndentation();
 	AddAssignToDest(&psInst->asOperands[0], psContext->psShader->sInfo.GetTextureDataType(psInst->asOperands[2].ui32RegisterNumber), 4, &numParenthesis);
 
@@ -799,7 +820,7 @@ void ToMetal::TranslateTexelFetchOffset(
 	}
 	bcatcstr(glsl, ")");
 
-	AddSwizzleUsingElementCount(glsl, destCount);
+	glsl << TranslateOperandSwizzle(&psInst->asOperands[2], psInst->asOperands[0].GetAccessMask(), 0);
 	AddAssignPrologue(numParenthesis);
 }
 
@@ -813,6 +834,7 @@ void ToMetal::TranslateTexCoord(
 {
 	uint32_t flags = TO_AUTO_BITCAST_TO_FLOAT;
 	uint32_t opMask = OPERAND_4_COMPONENT_MASK_ALL;
+	bool isArray = false;
 
 	switch (eResDim)
 	{
@@ -822,8 +844,21 @@ void ToMetal::TranslateTexCoord(
 		opMask = OPERAND_4_COMPONENT_MASK_X;
 		break;
 	}
-	case RESOURCE_DIMENSION_TEXTURE2D:
 	case RESOURCE_DIMENSION_TEXTURE1DARRAY:
+	{
+		// x for coord, y for array element
+		opMask = OPERAND_4_COMPONENT_MASK_X;
+		bstring glsl = *psContext->currentGLSLString;
+		glsl << TranslateOperand(psTexCoordOperand, flags, opMask);
+		
+		bcatcstr(glsl, ", round(");
+		
+		opMask = OPERAND_4_COMPONENT_MASK_Y;
+		flags = TO_AUTO_BITCAST_TO_FLOAT;
+		isArray = true;
+		break;
+	}
+	case RESOURCE_DIMENSION_TEXTURE2D:
 	{
 		//Vec2 texcoord. Mask out the other components.
 		opMask = OPERAND_4_COMPONENT_MASK_X | OPERAND_4_COMPONENT_MASK_Y;
@@ -840,22 +875,34 @@ void ToMetal::TranslateTexCoord(
 	}
 	case RESOURCE_DIMENSION_TEXTURE2DARRAY:
 	{
+		// xy for coord, z for array element
 		opMask = OPERAND_4_COMPONENT_MASK_X | OPERAND_4_COMPONENT_MASK_Y;
 		flags |= TO_AUTO_EXPAND_TO_VEC2;
 		
 		bstring glsl = *psContext->currentGLSLString;
 		glsl << TranslateOperand(psTexCoordOperand, flags, opMask);
 		
-		bcatcstr(glsl, ", ");
+		bcatcstr(glsl, ", round(");
 
 		opMask = OPERAND_4_COMPONENT_MASK_Z;
 		flags = TO_AUTO_BITCAST_TO_FLOAT;
-
+		isArray = true;
 		break;
 	}
 	case RESOURCE_DIMENSION_TEXTURECUBEARRAY:
 	{
-		flags |= TO_AUTO_EXPAND_TO_VEC4;
+		// xyz for coord, w for array element
+		opMask = OPERAND_4_COMPONENT_MASK_X | OPERAND_4_COMPONENT_MASK_Y | OPERAND_4_COMPONENT_MASK_Z;
+		flags |= TO_AUTO_EXPAND_TO_VEC3;
+		
+		bstring glsl = *psContext->currentGLSLString;
+		glsl << TranslateOperand(psTexCoordOperand, flags, opMask);
+		
+		bcatcstr(glsl, ", round(");
+		
+		opMask = OPERAND_4_COMPONENT_MASK_W;
+		flags = TO_AUTO_BITCAST_TO_FLOAT;
+		isArray = true;
 		break;
 	}
 	default:
@@ -868,6 +915,10 @@ void ToMetal::TranslateTexCoord(
 	//FIXME detect when integer coords are needed.
 	bstring glsl = *psContext->currentGLSLString;
 	glsl << TranslateOperand(psTexCoordOperand, flags, opMask);
+	
+	if (isArray)
+		bcatcstr(glsl, ")");
+
 }
 
 void ToMetal::GetResInfoData(Instruction* psInst, int index, int destElem)
@@ -875,12 +926,11 @@ void ToMetal::GetResInfoData(Instruction* psInst, int index, int destElem)
 	bstring glsl = *psContext->currentGLSLString;
 	int numParenthesis = 0;
 	const RESINFO_RETURN_TYPE eResInfoReturnType = psInst->eResInfoReturnType;
-	const int isUAV = (psInst->asOperands[2].eType == OPERAND_TYPE_UNORDERED_ACCESS_VIEW);
 
 	psContext->AddIndentation();
 	AddOpAssignToDestWithMask(&psInst->asOperands[0], eResInfoReturnType == RESINFO_INSTRUCTION_RETURN_UINT ? SVT_UINT : SVT_FLOAT, 1, "=", &numParenthesis, 1 << destElem);
 
-	const char *metalGetters[] = { ".get_width()", ".get_height()", ".get_depth()", ".get_num_mip_levels()" };
+	const char *metalGetters[] = { ".get_width(", ".get_height(", ".get_depth(", ".get_num_mip_levels()" };
 	int dim = GetNumTextureDimensions(psInst->eResDim);
 	if (dim < (index + 1) && index != 3)
 	{
@@ -899,17 +949,25 @@ void ToMetal::GetResInfoData(Instruction* psInst, int index, int destElem)
 			numParenthesis++;
 		}
 		glsl << TranslateOperand(&psInst->asOperands[2], TO_FLAG_NONE);
-		if (index == 2 &&
-			(psInst->eResDim == RESOURCE_DIMENSION_TEXTURE1DARRAY ||
-				psInst->eResDim == RESOURCE_DIMENSION_TEXTURE2DARRAY ||
-				psInst->eResDim == RESOURCE_DIMENSION_TEXTURE2DMSARRAY))
+		if ((index == 1 && psInst->eResDim == RESOURCE_DIMENSION_TEXTURE1DARRAY) ||
+			(index == 2 && (psInst->eResDim == RESOURCE_DIMENSION_TEXTURE2DARRAY ||
+				psInst->eResDim == RESOURCE_DIMENSION_TEXTURE2DMSARRAY)))
 		{
 			bcatcstr(glsl, ".get_array_size()");
 		}
 		else
+		{
 			bcatcstr(glsl, metalGetters[index]);
-
-		// TODO Metal has no way to query for info on lower mip levels, now always returns info for highest.
+			
+			if (index < 3)
+			{
+				if (psInst->eResDim != RESOURCE_DIMENSION_TEXTURE2DMS &&
+					psInst->eResDim != RESOURCE_DIMENSION_TEXTURE2DMSARRAY)
+					glsl << TranslateOperand(&psInst->asOperands[1], TO_FLAG_INTEGER); //mip level
+			
+				bcatcstr(glsl, ")");
+			}
+		}
 	}
 	AddAssignPrologue(numParenthesis);
 }
@@ -933,7 +991,6 @@ void ToMetal::TranslateTextureSample(Instruction* psInst,
 	Operand* psSrcBias = (ui32Flags & TEXSMP_FLAG_BIAS) ? &psInst->asOperands[4] : 0;
 
 	const char *funcName = "";
-	const char* offset = "";
 	const char* gradSwizzle = "";
 	const char *gradientName = "";
 
@@ -1165,7 +1222,6 @@ void ToMetal::TranslateTextureSample(Instruction* psInst,
 	AddAssignPrologue(numParenthesis);
 }
 
-static const char* swizzleString[] = { ".x", ".y", ".z", ".w" };
 
 // Handle cases where vector components are accessed with dynamic index ([] notation).
 // A bit ugly hack because compiled HLSL uses byte offsets to access data in structs => we are converting
@@ -1212,6 +1268,7 @@ void ToMetal::TranslateShaderStorageStore(Instruction* psInst)
 
 		break;
 	case OPCODE_STORE_RAW:
+	case OPCODE_STORE_UAV_TYPED: // Hack typed buffer as raw buf
 		psDest = &psInst->asOperands[0];
 		psDestByteOff = &psInst->asOperands[1];
 		psSrc = &psInst->asOperands[2];
@@ -1243,18 +1300,24 @@ void ToMetal::TranslateShaderStorageStore(Instruction* psInst)
 
 			bcatcstr(glsl, "[(");
 			glsl << TranslateOperand(psDestByteOff, dstOffFlag);
-			bcatcstr(glsl, " >> 2");
-			if (dstOffFlag == TO_FLAG_UNSIGNED_INTEGER)
-				bcatcstr(glsl, "u");
-			bcatcstr(glsl, ")");
-
-			if (component != 0)
+			if (psInst->eOpcode == OPCODE_STORE_UAV_TYPED)
 			{
-				bformata(glsl, " + %d", component);
+				bcatcstr(glsl, ")");
+			}
+			else
+			{
+				bcatcstr(glsl, " >> 2");
 				if (dstOffFlag == TO_FLAG_UNSIGNED_INTEGER)
 					bcatcstr(glsl, "u");
-			}
+				bcatcstr(glsl, ")");
 
+				if (component != 0)
+				{
+					bformata(glsl, " + %d", component);
+					if (dstOffFlag == TO_FLAG_UNSIGNED_INTEGER)
+						bcatcstr(glsl, "u");
+				}
+			}
 			bcatcstr(glsl, "]");
 
 			//Dest type is currently always a uint array.
@@ -1287,6 +1350,7 @@ void ToMetal::TranslateShaderStorageLoad(Instruction* psInst)
 		psSrc = &psInst->asOperands[3];
 		break;
 	case OPCODE_LD_RAW:
+	case OPCODE_LD_UAV_TYPED: // Hack typed buffer as raw buf
 		psDest = &psInst->asOperands[0];
 		psSrcByteOff = &psInst->asOperands[1];
 		psSrc = &psInst->asOperands[2];
@@ -1348,14 +1412,20 @@ void ToMetal::TranslateShaderStorageLoad(Instruction* psInst)
 		}
 		bcatcstr(glsl, "[(");
 		glsl << TranslateOperand(psSrcByteOff, srcOffFlag);
-		bcatcstr(glsl, " >> 2");
-		if (srcOffFlag == TO_FLAG_UNSIGNED_INTEGER)
-			bcatcstr(glsl, "u");
+		if (psInst->eOpcode == OPCODE_LD_UAV_TYPED)
+		{
+			bcatcstr(glsl, ")");
+		}
+		else
+		{
+			bcatcstr(glsl, " >> 2");
+			if (srcOffFlag == TO_FLAG_UNSIGNED_INTEGER)
+				bcatcstr(glsl, "u");
 
-		bformata(glsl, ") + %d", psSrc->eSelMode == OPERAND_4_COMPONENT_SWIZZLE_MODE ? psSrc->aui32Swizzle[component] : component);
-		if (srcOffFlag == TO_FLAG_UNSIGNED_INTEGER)
-			bcatcstr(glsl, "u");
-
+			bformata(glsl, ") + %d", psSrc->eSelMode == OPERAND_4_COMPONENT_SWIZZLE_MODE ? psSrc->aui32Swizzle[component] : component);
+			if (srcOffFlag == TO_FLAG_UNSIGNED_INTEGER)
+				bcatcstr(glsl, "u");
+		}
 		bcatcstr(glsl, "]");
 		
 		if (addedBitcast)
@@ -1635,9 +1705,9 @@ void ToMetal::TranslateAtomicMemOp(Instruction* psInst)
 
 	psContext->AddIndentation();
 
+	const ResourceBinding* psBinding = 0;
 	if (dest->eType != OPERAND_TYPE_THREAD_GROUP_SHARED_MEMORY)
 	{
-		const ResourceBinding* psBinding = 0;
 		psContext->psShader->sInfo.GetResourceFromBindingPoint(RGROUP_UAV, dest->ui32RegisterNumber, &psBinding);
 
 		if (psBinding->eType == RTYPE_UAV_RWTYPED)
@@ -1662,6 +1732,8 @@ void ToMetal::TranslateAtomicMemOp(Instruction* psInst)
 			case REFLECT_RESOURCE_DIMENSION_TEXTURECUBEARRAY:
 				texDim = 3;
 				break;
+			case REFLECT_RESOURCE_DIMENSION_BUFFER: // Hack typed buffer as raw buf
+				break;
             default:
                 ASSERT(0);
                 break;
@@ -1683,14 +1755,14 @@ void ToMetal::TranslateAtomicMemOp(Instruction* psInst)
 	if (shouldExtractCompare)
 	{
 		bcatcstr(glsl, "{\n");
-		psContext->AddIndentation();
+		++psContext->indent;
 		psContext->AddIndentation();
 		bcatcstr(glsl, "uint compare_value = ");
 		glsl << TranslateOperand(compare, ui32DataTypeFlag);
-		bcatcstr(glsl, "; ");
+		bcatcstr(glsl, ";\n");
+		psContext->AddIndentation();
 	}
-
-	if (previousValue)
+	else if (previousValue)
 		AddAssignToDest(previousValue, isUint ? SVT_UINT : SVT_INT, 1, &numParenthesis);
 
 	bcatcstr(glsl, func);
@@ -1709,18 +1781,20 @@ void ToMetal::TranslateAtomicMemOp(Instruction* psInst)
 	bcatcstr(glsl, "[");
 	glsl << TranslateOperand(destAddr, destAddrFlag, OPERAND_4_COMPONENT_MASK_X);
 	
-	// Structured buf if we have both x & y swizzles. Raw buf has only x -> no .value[]
-	if (destAddr->GetNumSwizzleElements(OPERAND_4_COMPONENT_MASK_X | OPERAND_4_COMPONENT_MASK_Y) == 2)
+	if (!psBinding || psBinding->eType != RTYPE_UAV_RWTYPED)
 	{
-		bcatcstr(glsl, "]");
-		bcatcstr(glsl, ".value[");
-		glsl << TranslateOperand(destAddr, destAddrFlag, OPERAND_4_COMPONENT_MASK_Y);
-	}
-	
-	bcatcstr(glsl, " >> 2");//bytes to floats
-	if (destAddrFlag == TO_FLAG_UNSIGNED_INTEGER)
-		bcatcstr(glsl, "u");
+		// Structured buf if we have both x & y swizzles. Raw buf has only x -> no .value[]
+		if (destAddr->GetNumSwizzleElements(OPERAND_4_COMPONENT_MASK_X | OPERAND_4_COMPONENT_MASK_Y) == 2)
+		{
+			bcatcstr(glsl, "]");
+			bcatcstr(glsl, ".value[");
+			glsl << TranslateOperand(destAddr, destAddrFlag, OPERAND_4_COMPONENT_MASK_Y);
+		}
 
+		bcatcstr(glsl, " >> 2");//bytes to floats
+		if (destAddrFlag == TO_FLAG_UNSIGNED_INTEGER)
+			bcatcstr(glsl, "u");
+	}
 	bcatcstr(glsl, "]), ");
 
 	if (compare)
@@ -1750,6 +1824,14 @@ void ToMetal::TranslateAtomicMemOp(Instruction* psInst)
 
 	if (shouldExtractCompare)
 	{
+		if (previousValue)
+		{
+			psContext->AddIndentation();
+			AddAssignToDest(previousValue, SVT_UINT, 1, &numParenthesis);
+			bcatcstr(glsl, "compare_value");
+			AddAssignPrologue(numParenthesis);
+		}
+		--psContext->indent;
 		psContext->AddIndentation();
 		bcatcstr(glsl, "}\n");
 	}
@@ -1834,8 +1916,9 @@ void ToMetal::TranslateInstruction(Instruction* psInst)
 	int numParenthesis = 0;
 
 #ifdef _DEBUG
-	psContext->AddIndentation();
-	bformata(glsl, "//Instruction %d\n", psInst->id);
+	// Uncomment to print instruction IDs
+	//psContext->AddIndentation();
+	//bformata(glsl, "//Instruction %d\n", psInst->id);
 #if 0
 	if(psInst->id == 73)
 	{
@@ -2003,7 +2086,6 @@ void ToMetal::TranslateInstruction(Instruction* psInst)
 		psContext->AddIndentation();
 		bcatcstr(glsl, "//OR\n");
 #endif
-		uint32_t destMask = psInst->asOperands[0].GetAccessMask();
 		if (psInst->asOperands[0].GetDataType(psContext) == SVT_BOOL)
 		{
 			uint32_t destMask = psInst->asOperands[0].GetAccessMask();
@@ -2179,8 +2261,20 @@ void ToMetal::TranslateInstruction(Instruction* psInst)
 		bcatcstr(glsl, "//UDIV\n");
 #endif
 		//destQuotient, destRemainder, src0, src1
-		CallBinaryOp("/", psInst, 0, 2, 3, SVT_UINT);
-		CallBinaryOp("%", psInst, 1, 2, 3, SVT_UINT);
+
+		// There are cases where destQuotient is the same variable as src0 or src1. If that happens,
+		// we need to compute "%" before the "/" in order to avoid src0 or src1 being overriden first.
+		if ((psInst->asOperands[0].eType != psInst->asOperands[2].eType || psInst->asOperands[0].ui32RegisterNumber != psInst->asOperands[2].ui32RegisterNumber)
+		 && (psInst->asOperands[0].eType != psInst->asOperands[3].eType || psInst->asOperands[0].ui32RegisterNumber != psInst->asOperands[3].ui32RegisterNumber))
+		{
+			CallBinaryOp("/", psInst, 0, 2, 3, SVT_UINT);
+			CallBinaryOp("%", psInst, 1, 2, 3, SVT_UINT);
+		}
+		else
+		{
+			CallBinaryOp("%", psInst, 1, 2, 3, SVT_UINT);
+			CallBinaryOp("/", psInst, 0, 2, 3, SVT_UINT);
+		}
 		break;
 	}
 	case OPCODE_DIV:
@@ -2240,8 +2334,8 @@ void ToMetal::TranslateInstruction(Instruction* psInst)
 		psContext->AddIndentation();
 		SHADER_VARIABLE_TYPE dstType = psInst->asOperands[0].GetDataType(psContext);
 		uint32_t typeFlags = TO_AUTO_BITCAST_TO_FLOAT | TO_AUTO_EXPAND_TO_VEC2;
-		if (psInst->asOperands[1].GetDataType(psContext) == SVT_FLOAT16
-			&& psInst->asOperands[2].GetDataType(psContext) == SVT_FLOAT16)
+		if (CanForceToHalfOperand(&psInst->asOperands[1])
+			&& CanForceToHalfOperand(&psInst->asOperands[2]))
 			typeFlags = TO_FLAG_FORCE_HALF | TO_AUTO_EXPAND_TO_VEC2;
 
 		if (dstType != SVT_FLOAT16)
@@ -2266,8 +2360,8 @@ void ToMetal::TranslateInstruction(Instruction* psInst)
 		psContext->AddIndentation();
 		SHADER_VARIABLE_TYPE dstType = psInst->asOperands[0].GetDataType(psContext);
 		uint32_t typeFlags = TO_AUTO_BITCAST_TO_FLOAT | TO_AUTO_EXPAND_TO_VEC3;
-		if (psInst->asOperands[1].GetDataType(psContext) == SVT_FLOAT16
-			&& psInst->asOperands[2].GetDataType(psContext) == SVT_FLOAT16)
+		if (CanForceToHalfOperand(&psInst->asOperands[1])
+			&& CanForceToHalfOperand(&psInst->asOperands[2]))
 			typeFlags = TO_FLAG_FORCE_HALF | TO_AUTO_EXPAND_TO_VEC3;
 
 		if (dstType != SVT_FLOAT16)
@@ -2736,7 +2830,7 @@ void ToMetal::TranslateInstruction(Instruction* psInst)
 		DeclareExtraFunction("BFI", "\
 		template <typename UVecType> UVecType bitFieldInsert(const UVecType width, const UVecType offset, const UVecType src2, const UVecType src3)\n\
 		{\n\
-			UVecType bitmask = (((1 << width)-1) << offset) & 0xffffffff;\n\
+			UVecType bitmask = (((UVecType(1) << width)-1) << offset) & 0xffffffff;\n\
 			return ((src2 << offset) & bitmask) | (src3 & ~bitmask);\n\
 		}; ");
 		psContext->AddIndentation();
@@ -2912,7 +3006,10 @@ void ToMetal::TranslateInstruction(Instruction* psInst)
 			}
 		}
 		psContext->AddIndentation();
-		bformata(glsl, "threadgroup_barrier(mem_flags::%s);\n", barrierFlags);
+		if (ui32SyncFlags & SYNC_THREADS_IN_GROUP)
+			bformata(glsl, "threadgroup_barrier(mem_flags::%s);\n", barrierFlags);
+		else
+			bformata(glsl, "simdgroup_barrier(mem_flags::%s);\n", barrierFlags);
 
 		break;
 	}
@@ -3010,6 +3107,16 @@ void ToMetal::TranslateInstruction(Instruction* psInst)
 #endif
 
 		psContext->psShader->sInfo.GetResourceFromBindingPoint(RGROUP_TEXTURE, psInst->asOperands[2].ui32RegisterNumber, &psBinding);
+        
+        if (psInst->eResDim == RESOURCE_DIMENSION_BUFFER) // Hack typed buffer as raw buf
+		{
+            psInst->eOpcode = OPCODE_LD_UAV_TYPED;
+			psInst->asOperands[1].eSelMode = OPERAND_4_COMPONENT_SELECT_1_MODE;
+			if (psInst->asOperands[1].eType == OPERAND_TYPE_IMMEDIATE32)
+				psInst->asOperands[1].iNumComponents = 1;
+			TranslateShaderStorageLoad(psInst);
+		break;
+		}
 
 		if (psInst->bAddressOffset)
 		{
@@ -3146,65 +3253,79 @@ void ToMetal::TranslateInstruction(Instruction* psInst)
 	case OPCODE_LD_UAV_TYPED:
 	{
 #ifdef _DEBUG
-								psContext->AddIndentation();
-								bcatcstr(glsl, "//LD_UAV_TYPED\n");
+        psContext->AddIndentation();
+        bcatcstr(glsl, "//LD_UAV_TYPED\n");
 #endif
-								Operand* psDest = &psInst->asOperands[0];
-								Operand* psSrc = &psInst->asOperands[2];
-								Operand* psSrcAddr = &psInst->asOperands[1];
+        Operand* psDest = &psInst->asOperands[0];
+        Operand* psSrc = &psInst->asOperands[2];
+        Operand* psSrcAddr = &psInst->asOperands[1];
 
-								int srcCount = psSrc->GetNumSwizzleElements();
-								int numParenthesis = 0;
-								uint32_t compMask = 0;
+        const ResourceBinding* psRes = 0;
+        psContext->psShader->sInfo.GetResourceFromBindingPoint(RGROUP_UAV, psSrc->ui32RegisterNumber, &psRes);
+        SHADER_VARIABLE_TYPE srcDataType = ResourceReturnTypeToSVTType(psRes->ui32ReturnType, psRes->ePrecision);
 
-								switch (psInst->eResDim)
-								{
-								case RESOURCE_DIMENSION_TEXTURE3D:
-								case RESOURCE_DIMENSION_TEXTURE2DARRAY:
-								case RESOURCE_DIMENSION_TEXTURE2DMSARRAY:
-								case RESOURCE_DIMENSION_TEXTURECUBEARRAY:
-									compMask |= (1 << 2);
-								case RESOURCE_DIMENSION_TEXTURECUBE:
-								case RESOURCE_DIMENSION_TEXTURE1DARRAY:
-								case RESOURCE_DIMENSION_TEXTURE2D:
-								case RESOURCE_DIMENSION_TEXTURE2DMS:
-									compMask |= (1 << 1);
-								case RESOURCE_DIMENSION_TEXTURE1D:
-									compMask |= 1;
-									break;
-								default:
-									ASSERT(0);
-									break;
-								}
+        if (psInst->eResDim == RESOURCE_DIMENSION_BUFFER) // Hack typed buffer as raw buf
+        {
+            psSrc->aeDataType[0] = srcDataType;
+            psSrcAddr->eSelMode = OPERAND_4_COMPONENT_SELECT_1_MODE;
+            if (psSrcAddr->eType == OPERAND_TYPE_IMMEDIATE32)
+                psSrcAddr->iNumComponents = 1;
+            TranslateShaderStorageLoad(psInst);
+            break;
+        }
 
-								SHADER_VARIABLE_TYPE srcDataType;
-								const ResourceBinding* psBinding = 0;
-								psContext->psShader->sInfo.GetResourceFromBindingPoint(RGROUP_UAV, psSrc->ui32RegisterNumber, &psBinding);
-								switch (psBinding->ui32ReturnType)
-								{
-								case RETURN_TYPE_FLOAT:
-									srcDataType = SVT_FLOAT;
-									break;
-								case RETURN_TYPE_SINT:
-									srcDataType = SVT_INT;
-									break;
-								case RETURN_TYPE_UINT:
-									srcDataType = SVT_UINT;
-									break;
-								default:
-									ASSERT(0);
-									break;
-								}
+#define RRD(n) REFLECT_RESOURCE_DIMENSION_ ## n
 
-								psContext->AddIndentation();
-								AddAssignToDest(psDest, srcDataType, srcCount, &numParenthesis);
-								glsl << TranslateOperand(psSrc, TO_FLAG_NAME_ONLY);
-								bcatcstr(glsl, ".read(");
-								glsl << TranslateOperand(psSrcAddr, TO_FLAG_UNSIGNED_INTEGER, compMask);
-								bcatcstr(glsl, ")");
-								glsl << TranslateOperandSwizzle(&psInst->asOperands[0], OPERAND_4_COMPONENT_MASK_ALL, 0);
-								AddAssignPrologue(numParenthesis);
-								break;
+        // unlike glsl, texture arrays will have index in separate argument
+        const bool isArray = psRes->eDimension == RRD(TEXTURE1DARRAY) || psRes->eDimension == RRD(TEXTURE2DARRAY)
+            || psRes->eDimension == RRD(TEXTURE2DMSARRAY) || psRes->eDimension == RRD(TEXTURECUBEARRAY);
+
+        uint32_t flags = TO_FLAG_UNSIGNED_INTEGER, opMask = OPERAND_4_COMPONENT_MASK_ALL;
+        switch (psRes->eDimension)
+        {
+        case RRD(TEXTURE3D):
+            opMask = OPERAND_4_COMPONENT_MASK_X | OPERAND_4_COMPONENT_MASK_Y | OPERAND_4_COMPONENT_MASK_Z;
+            flags |= TO_AUTO_EXPAND_TO_VEC3;
+            break;
+        case RRD(TEXTURECUBE): case RRD(TEXTURECUBEARRAY):
+        case RRD(TEXTURE2DARRAY): case RRD(TEXTURE2DMSARRAY): case RRD(TEXTURE2D): case RRD(TEXTURE2DMS):
+            opMask = OPERAND_4_COMPONENT_MASK_X | OPERAND_4_COMPONENT_MASK_Y;
+            flags |= TO_AUTO_EXPAND_TO_VEC2;
+            break;
+        case RRD(TEXTURE1D): case RRD(TEXTURE1DARRAY):
+            opMask = OPERAND_4_COMPONENT_MASK_X;
+            break;
+        default:
+            ASSERT(0); break;
+        }
+
+        int srcCount = psSrc->GetNumSwizzleElements(), numParenthesis = 0;
+        psContext->AddIndentation();
+        AddAssignToDest(psDest, srcDataType, srcCount, &numParenthesis);
+        glsl << TranslateOperand(psSrc, TO_FLAG_NAME_ONLY);
+        bcatcstr(glsl, ".read(");
+        glsl << TranslateOperand(psSrcAddr, flags, opMask);
+        if(isArray)
+        {
+            // NB cube array is handled incorrectly - it needs extra "face" arg
+            switch (psRes->eDimension)
+            {
+                case RRD(TEXTURE1DARRAY): opMask = OPERAND_4_COMPONENT_MASK_Y; break;
+                case RRD(TEXTURE2DARRAY): case RRD(TEXTURE2DMSARRAY): opMask = OPERAND_4_COMPONENT_MASK_Z; break;
+                case RRD(TEXTURECUBEARRAY): opMask = OPERAND_4_COMPONENT_MASK_W; break;
+                default: ASSERT(0); break;
+            }
+
+            bcatcstr(glsl, ", ");
+            glsl << TranslateOperand(psSrcAddr, TO_FLAG_UNSIGNED_INTEGER, opMask);
+        }
+        bcatcstr(glsl, ")");
+        glsl << TranslateOperandSwizzle(&psInst->asOperands[0], OPERAND_4_COMPONENT_MASK_ALL, 0);
+        AddAssignPrologue(numParenthesis);
+
+#undef RRD
+
+        break;
 	}
 	case OPCODE_STORE_RAW:
 	{
@@ -3227,57 +3348,82 @@ void ToMetal::TranslateInstruction(Instruction* psInst)
 
 	case OPCODE_STORE_UAV_TYPED:
 	{
-								   const ResourceBinding* psRes;
-								   int foundResource;
-								   uint32_t flags = TO_FLAG_UNSIGNED_INTEGER;
-								   uint32_t opMask = OPERAND_4_COMPONENT_MASK_ALL;
+        const ResourceBinding* psRes;
+        int foundResource;
+
 #ifdef _DEBUG
-								   psContext->AddIndentation();
-								   bcatcstr(glsl, "//STORE_UAV_TYPED\n");
+        psContext->AddIndentation();
+        bcatcstr(glsl, "//STORE_UAV_TYPED\n");
 #endif
-								   psContext->AddIndentation();
+        foundResource = psContext->psShader->sInfo.GetResourceFromBindingPoint(RGROUP_UAV,
+           psInst->asOperands[0].ui32RegisterNumber,
+           &psRes);
+        ASSERT(foundResource);
 
-								   foundResource = psContext->psShader->sInfo.GetResourceFromBindingPoint(RGROUP_UAV,
-									   psInst->asOperands[0].ui32RegisterNumber,
-									   &psRes);
+        if (psRes->eDimension == REFLECT_RESOURCE_DIMENSION_BUFFER) // Hack typed buffer as raw buf
+        {
+           psInst->asOperands[0].aeDataType[0] = ResourceReturnTypeToSVTType(psRes->ui32ReturnType, psRes->ePrecision);
+           psInst->asOperands[1].eSelMode = OPERAND_4_COMPONENT_SELECT_1_MODE;
+           if (psInst->asOperands[1].eType == OPERAND_TYPE_IMMEDIATE32)
+               psInst->asOperands[1].iNumComponents = 1;
+           TranslateShaderStorageStore(psInst);
+           break;
+        }
 
-								   ASSERT(foundResource);
+        psContext->AddIndentation();
 
-								   glsl << TranslateOperand(&psInst->asOperands[0], TO_FLAG_NAME_ONLY);
-								   bcatcstr(glsl, ".write(");
+        glsl << TranslateOperand(&psInst->asOperands[0], TO_FLAG_NAME_ONLY);
+        bcatcstr(glsl, ".write(");
 
-								   switch (psRes->eDimension)
-								   {
-								   case REFLECT_RESOURCE_DIMENSION_TEXTURE1D:
-									   opMask = OPERAND_4_COMPONENT_MASK_X;
-									   break;
-								   case REFLECT_RESOURCE_DIMENSION_TEXTURE2D:
-								   case REFLECT_RESOURCE_DIMENSION_TEXTURE1DARRAY:
-								   case REFLECT_RESOURCE_DIMENSION_TEXTURE2DMS:
-									   opMask = OPERAND_4_COMPONENT_MASK_X | OPERAND_4_COMPONENT_MASK_Y;
-									   flags |= TO_AUTO_EXPAND_TO_VEC2;
-									   break;
-								   case REFLECT_RESOURCE_DIMENSION_TEXTURE2DARRAY:
-								   case REFLECT_RESOURCE_DIMENSION_TEXTURE3D:
-								   case REFLECT_RESOURCE_DIMENSION_TEXTURE2DMSARRAY:
-								   case REFLECT_RESOURCE_DIMENSION_TEXTURECUBE:
-									   opMask = OPERAND_4_COMPONENT_MASK_X | OPERAND_4_COMPONENT_MASK_Y | OPERAND_4_COMPONENT_MASK_Z;
-									   flags |= TO_AUTO_EXPAND_TO_VEC3;
-									   break;
-								   case REFLECT_RESOURCE_DIMENSION_TEXTURECUBEARRAY:
-									   flags |= TO_AUTO_EXPAND_TO_VEC4;
-									   break;
-                                    default:
-                                        ASSERT(0);
-                                        break;
-								   };
+    #define RRD(n) REFLECT_RESOURCE_DIMENSION_ ## n
 
-								   glsl << TranslateOperand(&psInst->asOperands[2], ResourceReturnTypeToFlag(psRes->ui32ReturnType));
-								   bcatcstr(glsl, ", ");
-								   glsl << TranslateOperand(&psInst->asOperands[1], flags, opMask);
-								   bformata(glsl, ");\n");
+        // unlike glsl, texture arrays will have index in separate argument
+        const bool isArray = psRes->eDimension == RRD(TEXTURE1DARRAY) || psRes->eDimension == RRD(TEXTURE2DARRAY)
+            || psRes->eDimension == RRD(TEXTURE2DMSARRAY) || psRes->eDimension == RRD(TEXTURECUBEARRAY);
 
-								   break;
+        uint32_t flags = TO_FLAG_UNSIGNED_INTEGER, opMask = OPERAND_4_COMPONENT_MASK_ALL;
+        switch (psRes->eDimension)
+        {
+        case RRD(TEXTURE1D): case RRD(TEXTURE1DARRAY):
+           opMask = OPERAND_4_COMPONENT_MASK_X;
+           break;
+        case RRD(TEXTURE2D): case RRD(TEXTURE2DMS): case RRD(TEXTURE2DARRAY): case RRD(TEXTURE2DMSARRAY):
+           opMask = OPERAND_4_COMPONENT_MASK_X | OPERAND_4_COMPONENT_MASK_Y;
+           flags |= TO_AUTO_EXPAND_TO_VEC2;
+           break;
+        case RRD(TEXTURE3D): case RRD(TEXTURECUBE): case RRD(TEXTURECUBEARRAY):
+           opMask = OPERAND_4_COMPONENT_MASK_X | OPERAND_4_COMPONENT_MASK_Y | OPERAND_4_COMPONENT_MASK_Z;
+           flags |= TO_AUTO_EXPAND_TO_VEC3;
+           break;
+        default:
+            ASSERT(0);
+            break;
+        };
+
+
+        glsl << TranslateOperand(&psInst->asOperands[2], ResourceReturnTypeToFlag(psRes->ui32ReturnType));
+        bcatcstr(glsl, ", ");
+        glsl << TranslateOperand(&psInst->asOperands[1], flags, opMask);
+        if(isArray)
+        {
+            // NB cube array is handled incorrectly - it needs extra "face" arg
+            flags = TO_FLAG_UNSIGNED_INTEGER;
+            switch (psRes->eDimension)
+            {
+                case RRD(TEXTURE1DARRAY): opMask = OPERAND_4_COMPONENT_MASK_Y; break;
+                case RRD(TEXTURE2DARRAY): case RRD(TEXTURE2DMSARRAY):opMask = OPERAND_4_COMPONENT_MASK_Z; break;
+                case RRD(TEXTURECUBEARRAY): opMask = OPERAND_4_COMPONENT_MASK_Z; break;
+                default: ASSERT(0); break;
+            }
+
+            bcatcstr(glsl, ", ");
+            glsl << TranslateOperand(&psInst->asOperands[1], flags, opMask);
+        }
+        bformata(glsl, ");\n");
+
+#undef RRD
+
+        break;
 	}
 	case OPCODE_LD_RAW:
 	{
@@ -3566,10 +3712,10 @@ template <int N> vec<int, N> bitFieldExtractI(const vec<uint, N> width, const ve
 #endif
 		psContext->AddIndentation();
 		bool isFP16 = false;
-		if (psInst->asOperands[0].GetDataType(psContext) == SVT_FLOAT16
-			&& psInst->asOperands[1].GetDataType(psContext) == SVT_FLOAT16
-			&& psInst->asOperands[2].GetDataType(psContext) == SVT_FLOAT16
-			&& psInst->asOperands[2].GetDataType(psContext) == SVT_FLOAT16)
+		if (CanForceToHalfOperand(&psInst->asOperands[0])
+			&& CanForceToHalfOperand(&psInst->asOperands[1])
+			&& CanForceToHalfOperand(&psInst->asOperands[2])
+			&& CanForceToHalfOperand(&psInst->asOperands[2]))
 			isFP16 = true;
 		int parenthesis = 0;
 		AddAssignToDest(&psInst->asOperands[0], isFP16 ? SVT_FLOAT16 : SVT_FLOAT, 2, &parenthesis);
@@ -3682,6 +3828,21 @@ template <int N> vec<int, N> bitFieldExtractI(const vec<uint, N> width, const ve
 		bcatcstr(glsl, "//BUFINFO\n");
 #endif
 		psContext->m_Reflection.OnDiagnostics("Metal shading language does not support buffer size query from shader. Pass the size to shader as const instead.\n", 0, false); // TODO: change this into error after modifying gfx-test 450
+		break;
+	}
+			
+	case OPCODE_SAMPLE_INFO:
+	{
+#ifdef _DEBUG
+		psContext->AddIndentation();
+		bcatcstr(glsl, "//SAMPLE_INFO\n");
+#endif
+		const RESINFO_RETURN_TYPE eResInfoReturnType = psInst->eResInfoReturnType;
+		psContext->AddIndentation();
+		AddAssignToDest(&psInst->asOperands[0], eResInfoReturnType == RESINFO_INSTRUCTION_RETURN_UINT ? SVT_UINT : SVT_FLOAT, 1, &numParenthesis);
+		bcatcstr(glsl, TranslateOperand(&psInst->asOperands[1], TO_FLAG_NAME_ONLY).c_str());
+		bcatcstr(glsl, ".get_num_samples()");
+		AddAssignPrologue(numParenthesis);
 		break;
 	}
 
